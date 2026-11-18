@@ -1,6 +1,6 @@
 # [Triton/Gluon] sparse_mla_fwd: 64-head fp8 decode kernels for GLM-5.2 EP8 on gfx950
 
-Branch: `sparse-mla-decode-gfx950` (fork `rbrugaro-amd/aiter`), base upstream/main `ca7cfa1c3`.
+Branch: `sparse-mla-decode-gfx950` (fork `rbrugaro-amd/aiter`), base upstream/main `ca7cfa1c3`, head `9b366a032` (4th commit = black/ruff formatting only).
 
 ## Summary
 
