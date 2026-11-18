@@ -194,7 +194,7 @@ python op_tests/op_benchmarks/triton/bench_sparse_mla.py --num_heads 64 --num_se
 
 ### Reviewed revision
 
-cd6adea35c0ea01217db5cb86ce7949105b713e5
+8f6ebc24cb6d5d273b3073174914bb33913414f2
 
 ### Behavior and intent
 

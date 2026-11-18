@@ -210,7 +210,7 @@ python op_tests/op_benchmarks/triton/bench_fused_mla_qkv_a_proj_rmsnorm.py --bas
 
 ### Reviewed revision
 
-4a2b3388087be03a039807286c2edb7ef5ef5a0c
+0393961b4b5d5dc6abde9e30b6446a34471787ec
 
 ### Behavior and intent
 
