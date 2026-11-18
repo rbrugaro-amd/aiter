@@ -8,7 +8,9 @@ it uses. Each PR's code is on its own branch of this fork; nothing has been open
 |---|---|---|---|
 | [Sparse MLA decode, EP8 H=64 fp8 KV (`sparse_mla_fwd`)](pr_drafts/sparse-mla-decode-gfx950.md) | `sparse-mla-decode-gfx950` @ `bf1304b7e` | 1.35-2.50x rotating vs upstream main fp8-dot path (geomean 1.63x), 1.55-3.19x vs the bf16-dot path; numerics pass both seeds | **ready for review** |
 | GLM-5.2 FP8 DSA indexer prepare | `glm52-fp8-indexer-prepare` | not benchmarked yet | in progress |
-| [GLM-5.2 FP8 qkv_a + RMSNorm (new op `fused_mla_qkv_a_proj_rmsnorm`)](pr_drafts/mla-qkv-a-norm-quant-fused.md) | `mla-qkv-a-norm-quant-fused` (569c84010, cae025695) | 2.03x rotating geomean vs AITER chain, M 1-32; numerics pass both seeds | **branch pushed, ready for review** |
+| [GLM-5.2 FP8 qkv_a + RMSNorm (new op `fused_mla_qkv_a_proj_rmsnorm`)](pr_drafts/mla-qkv-a-norm-quant-fused.md) | `mla-qkv-a-norm-quant-fused` (head 4a2b338) | 2.03x rotating geomean vs AITER chain, M 1-32; numerics pass both seeds | **branch pushed, ready for review** |
+
+Upstream-facing PR bodies (no internal references; paste these): `pr_drafts/upstream/<branch>.md`. Internal versions with the pre-port columns and origin notes stay in `pr_drafts/<branch>.md`.
 
 Handoff (branches, image, what to test per PR): [HANDOFF_glm52_aiter_prs.md](HANDOFF_glm52_aiter_prs.md).
 
