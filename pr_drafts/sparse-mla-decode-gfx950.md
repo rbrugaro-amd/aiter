@@ -211,22 +211,59 @@ Kernels ported from the Artemis kernel packs, `glm52_fp8_ep8/sparse_paged_mla_xl
 
 ### Reviewed revision
 
-bf1304b7e045b515b85b6573074157f363273b91
+9b366a0329ea72cfef112d08f11ecdbd147aff76
 
 ### Behavior and intent
 
-A 64-head fp8 decode call with a -1-padded top-k table now runs dedicated kernels; the
-previous path did not take sentinels on its fp8 kernel and was 1.4-2.6x slower on this call.
+`sparse_mla_fwd` keeps its signature; one call pattern changes implementation: 64 query
+heads, fp8 e4m3 q with a per-tensor scale, fp8_scalar `[slots, 576]` cache, fp8 dots,
+`has_invalid=True` with a `[C, 2048]` -1-padded top-k table, C in {1, 2, 4, 8, 12, 16, 24,
+32}, flat cache below 2^31 bytes, gfx950, Triton >= 3.8. That call (GLM-5.2 FP8 TP8/EP8/DP8
+decode) previously ran the generic `_sparse_mla` kernel because the existing fp8 kernel is
+gated on `has_invalid=False`; it now runs three dedicated Gluon kernels that are 1.35-2.50x
+faster and pass the wide-magnitude numerics draw that the previous fp8 path fails. Every other
+call runs exactly what upstream main runs today.
 
 ### Validation and unverified scope
 
-See Performance / Numerics / Testing. Unverified: pools >= 2^31 B (the route excludes them),
-Triton 3.9 (`_HAS_REINTERPRET` branch is the same switch `sparse_mla_fp8.py` uses).
+Hardware: MI355X (gfx950), ROCm 7.2.4, Triton 3.8.0, torch 2.11.0+rocm7.2, AITER base
+`ca7cfa1c3`. Commands: `pytest -q op_tests/triton_tests/attention/test_sparse_mla.py` (172
+passed, 2 skipped: pre-existing arch skips; the new `-k h64` tests are 30 of them and were
+re-run after the formatting commit: 30 passed) and
+`python op_tests/op_benchmarks/triton/bench_sparse_mla.py --num_heads 64 --num_seqs 1 2 4 8 12 16 24 32 --has_invalid`.
+Device time by CUDA-graph replay (rotating and hot inputs, ABBA, 3 x 15 rounds) against
+upstream main's fp8 and bf16 paths, in-process and on a separate unmodified copy of upstream
+main (Performance tables); numerics vs an fp32 reference on seeds 0 and 100 (Numerics table);
+eager wall time of routed and not-routed calls. `black --check` and `ruff check` pass (ruff
+0.17.5; CI pins 0.16.0). Unverified: caches >= 2^31 bytes (the route excludes them and they
+fall to the generic kernel), Triton 3.9 (`_HAS_REINTERPRET` branch is the same switch
+`sparse_mla_fp8.py` uses; not executed), architectures other than gfx950 (route never fires,
+not executed), non-unit q/cache scales are tested for correctness but not benchmarked, and
+end-to-end serving (SGLang does not call `sparse_mla_fwd` today).
+
+### PR-specific question
+
+Which exact workload keys consume these configuration changes, and what evidence shows that
+unrelated shapes keep their previous selection? `configs/gfx950/gluon/attention/sparse_mla/DEFAULT.json`
+gains one new top-level family `_sparse_mla_fp8_h64` with keys `M_1`, `M_2`, `M_4`, `M_8`,
+`M_12`, `M_16`, `M_24`, `M_32` (row count C); only `_h64_decode_config` in `sparse_mla.py`
+reads that family, and only after every contract check listed above passes. The existing
+`_sparse_mla` entry in the same file is untouched (diff shows additions only), so bf16-q,
+bf16-dot, H != 64, `has_invalid=False`, > 2 GB and non-listed-C calls select what they did
+before: `test_sparse_mla_fp8_h64_fallback` asserts that five such calls do not route and stay
+correct, the full existing `test_sparse_mla.py` suite passes unchanged, and the eager timing
+of four not-routed calls matches upstream main within noise (Performance, eager table).
 
 ### Changed op tests
 
-`test_sparse_mla.py`: new H64 decode tests cover the new kernels (routing asserted via
-`_h64_decode_config`), the output-buffer contract and the fallback contracts; no existing test
-changed.
+- `op_tests/triton_tests/attention/test_sparse_mla.py`: adds `test_sparse_mla_fp8_h64_decode`
+  (8 row counts x 3 draws: benign, wide-magnitude q with clustered keys and 5% holes, non-unit
+  q/cache scales, with one empty row), `test_sparse_mla_fp8_h64_out_buffer` (caller-provided
+  `out` with strides) and `test_sparse_mla_fp8_h64_fallback` (five contracts that must not
+  route and must stay correct). The existing tests never reach the new kernels (they use
+  bf16 q or `has_invalid=False`), so this coverage is not redundant; no existing test changed.
+- `op_tests/op_benchmarks/triton/bench_sparse_mla.py`: adds `--has_invalid`, which builds
+  -1-padded `topk`-wide rows so the benchmark can reach the new route; default behavior is
+  unchanged.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
