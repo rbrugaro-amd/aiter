@@ -1,0 +1,84 @@
+S12 (Qwen3.5 MXFP4 GDN prefill, bf16 output) -- status: DONE (after a daemon outage 06:27-06:43 UTC).
+Blocks on GPU 4: n38 b1(+numerics), n37 b1(+numerics), n38 b2, n37 b2, n38 b3, n37 b3.  Table: results/S12.md / S12.csv.
+Verdict: KEEP (PR).  T vs best AITER composition (eager, as served): 3.7x-5.7x, geomean 4.66x over 15 shapes;
+5120 tokens 4.95x, 16384 tokens 3.96x (decision rule >= 1.3x: met).  Device-only kernel time
+(results/S12/n38_devtime.json, torch.profiler sum of kernels): T 3.1-4.4x faster than B1 (e.g. 5120: 132 vs 368 us;
+16384: 297 vs 1016 us), so the win is not host overhead.  vs stock SGLang FLA path (context, X_fla): 2.5-3.5x eager,
+1.6-3.6x device-only.  B37 (unmodified nightly, Triton 3.7) = same AITER chain, within noise of n38 B (port gated off
+there too: "Triton >= 3.8 required ..., got 3.7.0").  Best AITER arm: B1 (triton conv + chunk_gated_delta_rule_opt)
+or B2 (plain chunk GDR, q/k expanded) at <= 5120 tokens; HIP conv (B1h) never best.
+Numerics: T passes every cell (3 seeds x 15 shapes) under the stock-envelope rule below; conv_state bytes exact.
+Controls: A/A (T#2, B1#2) <= ~2% typically, merge noise floor up to 17% from block-to-block ratio spread on the
+batched rows (still far below the 4-5x effect).  Calibration copy kernel: n37 b3 ran twice at ~5050 GB/s vs ~5510
+for all other blocks (>2% low; likely co-scheduled forks on other GPUs); the first copy was moved to
+results/S12_debug_excluded/, the rerun kept -- it only affects B37 and does not change any conclusion.
+B arm note: the AITER chain's gates are plain torch elementwise ops (3-5 tiny kernels; no AITER gating op exists).
+
+Harness: xbench/cands/S12.py (arms, gen, fp32 reference, check), S12_dbg.py (debug probes).
+Inputs: 15 shapes x 3 seeds generated on node (/scratch/xb/inputs/S12, sha256 manifest), each with
+fp32 reference + stock-SGLang error envelope.  Harness seed 0 -> spec seed 300 (served fast path),
+100 -> adversarial, 1 -> benign (exact path).  State pool shrunk to 32 slots (2 x max batch).
+Shapes: xl template: s1024/5120/8192/16384 x i0/i1, 8x1024 i0/i255, 16x1024 i0, (4096,10240) i2,
+(2048,5120,5120,4096) i8; r3 template: s10240 i0, (4096,5120,5120,2048) i8.
+Timing design: eager (template not graph-safe), 20 calls/round, 7 ABBA rounds; every call gets its own
+copy of the state pools (20 copies, reset before each round) so chained in-place state updates never
+change the template's data-dependent exact/fast path.
+
+TRACE (SGLang 703e763d5f, code read of gdn_backend.py / gdn_triton.py / gdn_aiter.py / qwen3_5.py):
+  Qwen3.5 GDN prefill/extend on ROCm runs NO AITER kernel.  Path: qwen3_5_gdn_prefill_projection_views
+  (strided views) -> sglang triton causal_conv1d_fn -> sglang fused_qkv_split_gdn_prefill ->
+  sglang fused_gdn_gating -> FLA chunk_gated_delta_rule (sglang.kernels.ops.attention.fla, indexed
+  in-place state [N,H,V,K]) -> FLA RMSNormGated.  GDNKernelDispatcher only accepts triton/cutedsl/
+  flashinfer/intel_xpu for prefill; AITER is used only for target-verify with
+  --linear-attn-verify-backend aiter (FlyDSL flydsl_gdr_mtp_sglang + causal_conv1d_update_sglang_flydsl).
+  fused_gdn_prefill_qkvz / fused_gdn_decode_qkvz / paged_attention_output_gate_group_fp8_quant are not
+  referenced anywhere in sglang/srt or sglang/kernels -> SGLang never calls them, under any condition.
+  Kernel trace (n38_b0_trace.jsonl): X_fla = _causal_conv1d_fwd_kernel | fused_qkv_split_gdn_prefill_kernel |
+  fused_gdn_gating_kernel | l2norm x2 | chunk_local_cumsum | kkt_solve | recompute_w_u | fwd_kernel_h | chunk_fwd_kernel_o |
+  layernorm_gated.  T = _prepare_chunks | _affine_recurrence | _state_prefix | _readout_norm (4 launches).
+B_port: aiter fused_gdn_prefill_qkvz_supported(...) -> False on every Qwen3.5 shape:
+  "delta_state must be [N, 8, 128, 128], got (32, 16, 128, 128)" (Qwen3-Next topology only; also needs
+  qkvz 3072 / ba 16 and emits fp8).  In the n37 image it would additionally fail the Triton>=3.8 gate.
+B1/B1h/B2 (AITER composition) wiring findings:
+  - chunk_gated_delta_rule_opt handles GVA (4 q/k heads, 16 v heads) correctly; plain
+    chunk_gated_delta_rule rejects it (initial_state must have H=4) -> B2 expands q/k (counted).
+  - AITER reads initial_state as contiguous [N,H,K,V]; a transposed view of SGLang's [N,H,V,K] pool
+    silently gives wrong outputs (final state still right) -> B arms pay gather+transpose+contiguous and
+    a transposed scatter of the final state (counted).
+  - AITER has no bf16-output gated RMSNorm (only fp8/mxfp4 quant variants) -> stage 4 uses SGLang FLA
+    RMSNormGated (non-AITER, flagged).
+Numerics (debug run at 1024 tokens, i0/i1, 3 seeds): T, B1, B1h, B2 and stock X_fla all agree with the
+  fp32 reference to the same error level (output med-abs ~3e-4 fast/benign; all arms miss the strict
+  bf16 atol 2^-5 only on ~1e-6 of elements; adversarial seed: all arms ~9.6% beyond tol because of bf16
+  conv output on near-cancelling taps, except the HIP-conv chain B1h).  Pass rule therefore = within
+  1.25x of the stock path's output error and 2x of its final-state error (strict stats kept).
+  T passes on all debug cells; no T numerics blocker found.  conv_state bytes exact for every arm.
+Not run: fp8 Qwen3.5 template (gdn_prefill_group_fp8_quant_templated, head-interleaved layout +
+  conv bias + fp8 out) -- out of budget; optional port calibration at Qwen3-Next shapes -- not run.
+Harness issues seen: $B/sync rsync fails on root-owned __pycache__ on the node (and once left a stale
+  copy); used rsync --exclude __pycache__.  Files written by containers are root-owned on node scratch
+  (delete from inside a container).
+(Done) Block recipe: /tmp/s12blocks.sh logic = n38 b1 (--numerics), n37 b1, n38 b2, n37 b2, n38 b3, n37 b3 on
+  GPU 4: IMG=n38|n37 $B/rn 4 "python -m xbench.run --cand S12 --block <b> [--numerics]", then $B/pull and
+  python3 -m xbench.merge S12.  Decision rule: keep only if T >= 1.3x best AITER arm at 5120 and 16384.
+
+==== S12f: Qwen3.5 FP8 GDN prefill + gated RMSNorm + group-128 FP8 quant (separate module cands/S12f.py)
+Template: qwen3_5/fp8/gdn_prefill_group_fp8_quant_templated/gdn_prefill_template.py (affine regime on contiguous
+rows, paired16 on v2 rows; v2 rows include the adapter's per-call pack() of the projections, as served).
+Arms: B1 = AITER triton conv(+bias) -> torch gates -> chunk_gated_delta_rule_opt -> aiter gated_rmsnorm_fp8_group_quant
+(HIP); B1h HIP conv; B2 plain chunk GDR; X_fla = stock SGLang FLA chain + AITER per_1x128 quant (context).
+Blocks: n38 b1(+numerics) n37 b1(+numerics) n38 b2 n37 b2 n38 b3 n37 b3 on GPU 4.  Table: results/S12f.md/.csv.
+Eager (served; prefill is not graph-captured): T 1.47-2.07x vs best AITER arm, geomean 1.74x;
+  5000: 1.80x, 16384: 1.67x (rule >= 1.3x met on eager).  B37 within noise of B.  vs stock X_fla: 1.02-1.57x.
+DEVICE-ONLY (n38_devtime.json, kernel time sum) tells a different story: T vs B1 = 5000: 347 vs 357 us (1.03x),
+  5000x3: 695 vs 768 (1.10x), 16384: 715 vs 967 (1.35x), 10000+6384: 730 vs 874 (1.20x), 15360 (v2, b8): 534 vs
+  771 (1.44x), 16384 (v2, b8): 542 vs 830 (1.53x).  vs stock FLA device-only: 1.00-1.51x.
+  -> most of the eager win at <=15000 contiguous tokens is the AITER chain's host launch overhead (~15 launches +
+  torch gate ops), not kernel time.  Kernel-time rule (>=1.3x at 5000 and 16384) fails at 5000.
+  Note: the MXFP4-pack xl template (S12 above) does the same recurrence 2.6x faster than this fp8 template at
+  ~5k tokens (132 vs 347 us device); an upstream fp8 PR should be built from the xl lineage + fused fp8 quant.
+Numerics: all arms pass all 12 cells (6 shapes x seeds 0/100) under the stock-envelope rule (dequantized fp8 output
+  vs fp32 reference); on the adversarial seed T is ~5x more accurate than B1/B2/stock (max-abs 0.25 vs 1.26-1.79).
+  conv_state bytes exact; scales finite/positive.
+Calibration: n38 b1 copy kernel 5028 GB/s (vs ~5520 elsewhere, >2% low; other forks' load); per-block speedup
+  spread stays within 0.03-0.09, so b1 was kept and flagged rather than rerun.

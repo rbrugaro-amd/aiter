@@ -1,0 +1,38 @@
+S10 Kimi-K3 attention-residual gate (H=7168), GPU 6, image nightly1117-triton38, 3 blocks (b1 with numerics, seeds 0/100/200).
+
+TRACE (SGLang 703e763d5f, srt/layers/attn_residual.py): on ROCm, AttnResidual.forward -> _aggregate /
+_aggregate_fused_add -> _aggregate_hip whenever supports_attn_res_hip(H, nvb) (H=7168, nvb<=8: always for K3).
+That launches SGLang's own single Triton kernel sglang/kernels/ops/attention/attn_res_hip._agg_kernel (pending add,
+bank snapshot and output RMSNorm folded). AITER is NOT called. Profiled kernels: X_native = _agg_kernel;
+T = _fused_four/_fused_pair/_fused_eight_normalized (M<=8), _attention_residual_kernel/_snapshot_kernel (M>=32);
+B = attnres_fwd_kernel (AITER Triton, config-table pick) [+ one torch copy when the bank view is strided].
+
+ARMS: T template; B = aiter attn_res_gate with a contiguous packed [M,nvb,H] block (ATOM layout, prep untimed),
+close_block=True as-is on write modes (allocates a new [M,nvb+1,H] block); B_strided = same op on SGLang's bank view
+bank[:, :nvb] (AITER copies it to contiguous each call, +2.5-13 us); B1 = close_block=False + bank row copy (write
+modes); X_native = SGLang stock attn_res_hip (context). Best AITER arm is B everywhere except m1 rotating (B_strided,
+identical within noise since nvb... single row). Rotating ring per run.py (all inputs rotated).
+
+RESULT: T wins every one of 33 served (M,nvb,mode) keys, hot and rotating. Rotating uniform geomean 1.46x vs best
+AITER arm (range 1.07x m128_v1_md5 .. 1.86x m128_v4_md6); hot 1.55x. Weakest: nvb=1 mode 5 at M>=128 (1.07-1.08x
+rotating) -- those single cells are below 1.10x. A/A <= 2.6%, block spread tiny. T vs SGLang stock X_native
+(context): T faster at every key too (e.g. m8_v8_md4 rot 5.89 vs 12.48 us).
+Uniform weights (no per-(nvb,mode) serving distribution recorded); M weights not applied.
+
+NUMERICS: T passes all seeds/keys (out bf16 criterion; current and bank bytewise). AITER attn_res_gate FAILS the
+seed-100 wide-magnitude draw at (32|128|256, nvb=1, mode 5): out max_abs 0.08-0.62, 0.1% of elements out of tol,
+1.7% >2 bf16 ULP (T/X_native: 0 fails, 99.99% 0-ULP). Mode 5 = with addend; likely AITER mixes the fp32 (un-rounded)
+prefix+addend while the bank row / current is the bf16-rounded sum (current bytes themselves match). Not a T blocker.
+
+EAGER WALL TIME (no graphs, per-call wall us, median of 5 x 300 calls, GPU 6, run 06:4x after daemon restart):
+  key           T      B     B_strided  X_native  B1
+  m1_v4_md5   21.5   12.7   12.7       20.4
+  m8_v8_md4   19.2   11.0   17.3       19.1
+  m64_v4_md6  15.4   13.2   19.1       19.3      16.5
+  m256_v8_md4 20.2   11.1   23.1       19.5
+  Eager, every arm is host-bound (device time 3-12 us). AITER's launch cache (_LAUNCH_CACHE_ENABLED) makes B
+  ~1.2-1.8x cheaper on host than T's Python host entry; T is about equal to SGLang's own wrapper. So for a non-graph
+  user (vLLM/ATOM eager) the template's host path would need the same launch caching to keep its device-time win.
+  Under CUDA graphs (serving), host cost vanishes and the device-time table above applies.
+
+VERDICT: PR (rotating weighted speedup 1.46x >= 1.10x vs best AITER arm, T numerics pass).

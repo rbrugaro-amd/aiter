@@ -1,0 +1,79 @@
+S4 sparse MLA decode (GLM-5.2, fp8_scalar KV [P,576] unit scale, top-k 2048) - image n38 (nightly 581579ab5 + Triton 3.8), GPU 1.
+Done: 3 blocks (block 1 with all arms; blocks 2/3 T,B,B1,B2,B3), numerics pass for all 37 shapes x seeds 0/100 (results/S4/n38_b1_num.jsonl),
+trace, pool probes. Merged: results/S4.md, results/S4.csv. 37 shapes, hot + rotating.
+Stale smoke numerics (older check that had no fp8-query reference) moved to results/S4/stale_smoke/ on the host. On the node the copies
+could not be moved (permission denied), so a later $B/pull will put n38_b0_trace*.jsonl back into results/S4/. Delete them before running merge,
+otherwise fp8_tp8_h8_m8/m64 show a false "T numerics FAIL".
+
+TRACE (SGLang 703e763d5f, srt/layers/attention/dsa_backend.py, arg_groups/overrides.py:757-760)
+- HIP default --dsa-decode-backend = "triton": SGLang's own triton_sparse_mla_decode_splitk (_sparse_mla_split_k_kernel + reduce). Not AITER.
+- "aiter" (our MXFP4 serving): _forward_aiter does the following per call (about 10 kernels in total):
+  - pads heads with repeat_interleave(16//H) at H=8;
+  - computes valid counts and their cumsum, then runs get_valid_kv_indices (SGLang Triton);
+  - runs get_mla_metadata_v1 (persistent schedule);
+  - runs aiter.mla.mla_decode_fwd asm "mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_ps" (fp8 q at EP8: same family) + kn_mla_reduce_v1;
+  - un-pads the output with o[:, ::rep].
+- "tilelang" (our FP8 / EP8 serving): tilelang_sparse_fwd. Not AITER.
+- SGLang never calls aiter sparse_mla_fwd. Inside sparse_mla_fwd, the Gluon fp8_scalar kernel runs only with dot_precision="fp8" and
+  has_invalid=False (no -1 sentinels). With the served [m,2048] slot table, both precisions run the generic Triton _sparse_mla.
+  The path does not change with the Triton version, so B37 was not run.
+
+ARMS
+- T: the template served by the profile manifest (sha checked). For FP8 EP8 the active manifest is sparse_paged_mla.json (there is no _templated.json).
+- B: SGLang _forward_aiter run verbatim (unbound method on a stand-in self), all per-call prep counted.
+- B1: sparse_mla_fwd with bf16 dots. B2: sparse_mla_fwd with fp8 dots (generic kernel).
+- B3: Gluon fp8 kernel, with SGLang's per-call compaction counted.
+- Context (block 1 only): Xk_asm and Xk_fp8gluon (prep hoisted out), X_triton (SGLang HIP default), X_tilelang.
+- Inputs: family-spec draws.
+  - Pool sizes: 262144 rows; 4194304 rows (2.42 GB > 2^31) for the _L rows.
+  - EP8 rows use a unit-scale fp8 query, which is their contract.
+  - Rotating cache: a 256-copy ring of query and slots; the KV pool is shared.
+
+NUMERICS (fp32 reference, bf16 criterion; fp8-query arms are judged against a reference built on the same fp8 query:
+unit-scale for fp8-profile T / X_triton / X_tilelang, per-head for B2 / B3)
+- T passes both seeds on 36/37 shapes. One real T FAILURE: mx_tp8_h8_m32_L (decode_tp8_narrow, KV pool > 2^31 bytes), seed 0:
+  max_abs 0.84, 18.7 % of elements out of tolerance. Seed 100 passes. B/B1 pass there.
+  -> decode_tp8_narrow is wrong on >2 GB pools for benign draws.
+- B (SGLang aiter asm) passes everywhere at H=8/16, but FAILS seed 100 (peaked q) on every EP8 H=64 row.
+- B1 (bf16 dots) passes everywhere: it is the "best numerically passing AITER arm".
+- B2 fails almost everywhere. B3 fails seed 100 almost everywhere.
+  -> merge's "best AITER arm" (B2) is a numerically failing arm. Headline below uses both.
+
+TIMING (3 blocks; A/A and block-ratio noise floor 0.4-4 %)
+- Rotating geomean of T vs the best AITER arm by group:
+  | group | vs B2 (fastest AITER arm, fails numerics) | vs B1 (fastest AITER arm that passes numerics) |
+  |---|---|---|
+  | mx TP4/TP8 H16/H8 | 1.85x (1.23-2.90) | 2.32x |
+  | mx large pool | ~2.0x | 2.48x |
+  | fp8ep8 H64 | 1.36-2.60x | 2.11x |
+  | mxep8 H64 | 1.69-2.15x | 2.21x |
+  | fp8 TP8 H8 | mixed, overall 1.00x | 1.00x |
+- fp8 TP8 H8 per template (vs B2 / vs B1):
+  - m8_x M1-16: 2.2-3.1x / 2.8-3.7x.
+  - split M32: 1.39x / 1.71x.
+  - policy M48/96/192: 1.06-1.22x / 1.3-1.6x.
+  - policy M12/24: 0.85-0.90x (LOSS) / 1.03-1.08x.
+- PATHOLOGY (fp8 TP8): split M64 = 372 us, policy M128 = 638 us, policy M256 = 802 us vs B2 22/32/53 us (0.05-0.07x).
+  m8_x M8 on the >2^31 pool = 29.3 us vs 5.3 us (0.47x).
+  Probes (cands/S4_probe.py, S4_probe2.py, T and B2 under graph, 5 rounds):
+  - It is NOT pool size, and NOT a fallback branch: the host code only branches on cache bytes < 2^31.
+  - It is the SPREAD of the selected slot ids:
+    - same draw over 65536 rows: m64 15.7 us, m128 25.0 us, m256 45.9 us (faster than B2: 20.5 / 29.9 / 48.9);
+    - same draw over 262144 rows: 371 / 637 / 805 us;
+    - the same 65536-row draw placed inside a 262144- or 4194304-row pool: fast again;
+    - over 131072 rows: m64 fast (16.7 us), m128 slow (632 us).
+  - B2 is insensitive to all of these.
+  - The manifests and contract do not bound pool size or slot spread (the spec says serving pools are up to 3.7M rows), so these rows are
+    measured INSIDE the served contract. The family spec (POOL 65536, 37.7 MB) never exercises this.
+  - Separate effect: m8_x is slow on pools > 2^31 bytes, because the buffer-load path is off there (documented fallback; a real
+    serving case at large pools).
+
+VERDICT (stop rule: rotating speedup >= 1.10x vs best AITER arm, and T numerics pass)
+- mx TP4 decode_tp4_small (M1/2/16) and TP8 decode_tp8_deep (M128/256): PR. 1.23-2.9x vs B2, 1.7-3.5x vs B1, numerics pass.
+- mx TP8 decode_tp8_narrow (M32): speed PR-worthy (1.6x), but BLOCKER: numerics fail on >2^31-byte pools (seed 0). Must fix first.
+- EP8 H=64 (glm52_fp8_ep8 xl m1_m8 / m12_m24 / m16_m32, glm52_ep8 r3 decode_ep8 / d16_d32): PR. 1.36-2.6x vs B2, ~2.1-2.2x vs B1,
+  numerics pass on both seeds (AITER's asm B fails seed 100 at H=64).
+- fp8 TP8 decode_tp8_m8_x (M1-16): speed PR-worthy on pools < 2^31 bytes (2.2-3.1x), but 0.47x on pools > 2^31 bytes. Needs the large-pool path fixed.
+- fp8 TP8 spm_tp8_split (M32 ok; M64 pathological) and spm_tp8_policy (M12/24 losses, M128/256 pathological when slot spread > ~64-128k rows):
+  NO PR until the slot-spread slowdown is fixed.
+- B37 not applicable. X_triton (SGLang's actual HIP default) is 1.4-1.9x slower than T on the mx rows and roughly at parity / slower on EP8.

@@ -1,0 +1,69 @@
+C1 (MiniMax-M2.5 paged GQA decode/prefill, FP8 KV, Hq12/Hk2/D128, page 1) -- notes
+Modules: xbench/cands/C1_common.py (shared 4.5M-slot FP8 pool, saved once per draw class under
+inputs/C1pool), C1d.py (decode), C1p.py (prefill), C1g.py (Qwen3.5 output-gate member, parity only).
+GPU 7, image nightly1117-triton38 (n38).
+
+TRACE (SGLang 703e763d5f, srt/layers/attention/aiter_backend.py; MiniMax-M2.5 = full attention,
+no SWA, default (non-5D) paged pool, page 1, FP8 KV, SGLANG_USE_AITER_UNIFIED_ATTN unset):
+- decode: forward_decode non-MLA else-branch (aiter_backend.py:5719-5747) ->
+  aiter.paged_attention_ragged(o, workspace, q, k.view(-1,1,2,128), v..., scale, kv_indptr,
+  kv_indices (= graph buffer), kv_last_page_len, 1, num_partitions, None, "fp8_e4m3", "NHD",
+  0.0, k_scale, v_scale, None, 256).  Kernels: paged_attention_ll4mi_QKV_mfma16_kernel<...fp8,
+  GQA 6...> + paged_attention_ll4mi_reduce_kernel (HIP/CK-tile "ll4mi" PA, not Triton).
+  num_partitions comes from SGLang's decode graph buckets (aiter_backend.py:534, 2624-2654):
+  graph capacity 65536 -> max_num_partitions 256, buckets p16 (max_seq <= 4096) and pmax (256);
+  capacity 131072 -> p16 / p128 (<= 32768) / pmax 512.  Workspace sized for max_bs 256.
+- prefill/extend: the HD128 FP8 asm prefill (flash_attn_varlen_fp8_pertensor_func) requires a
+  GQA ratio in {1,2,4,8,16} (aiter_backend.py:547) and the paged asm prefill needs head_dim 256,
+  so MiniMax (GQA 6, hd 128) falls through to the "NHD path" (aiter_backend.py:5420-5508):
+  scaled_fp8_quant(q, static q_scale=1.0) + aiter.mha_batch_prefill_func(q8, k_cache, v_cache,
+  qo_indptr, kv_indptr, kv_indices, max_q, max_k, causal=True, q/k/v_descale).  Kernels:
+  aiter scaled_quant_kernel + ck_tile FmhaBatchPrefillWithPagedKVCacheKernel (CK).
+- Optional AITER alternative (B1, both phases): unified_attention (Triton/Gluon
+  _unified_attention_gluon_kernel + reduce_segments), the SGLANG_USE_AITER_UNIFIED_ATTN path.
+
+ARMS
+decode : T = templated row of the fp8 TP4-EP4 profile (rows 1..16 split_r3::paged_gqa_attention_ep4,
+         rows 32/64 r3::paged_gqa_attention); Ttp4 (rows 4, TP4 profile tp4 entry);
+         B = paged_attention_ragged with SGLang's bucket partitions; B2 = same op with
+         ceil(max_seq/256) partitions; B1 = unified_attention (q fp8 quant counted, 2-D page
+         table built outside the graph, as SGLang's metadata step does).
+         kv_indices = 256*65536 entries (graph capacity, as served) -- the templates key their
+         schedule on kv_indices.numel()/sequences.
+prefill: T = paged_gqa_prefill_r3_template::paged_gqa_attention with q_scale = k_scale (binder);
+         B = scaled_fp8_quant + mha_batch_prefill_func (SGLang); B1 = unified_attention.
+
+FINDINGS SO FAR
+- Tight kv_indices (numel = live tokens, ctx 16k): T cannot run -- split_r3 e9 raises
+  "capacity 16384 outside the served bucket", r3 rows 64 raises "not a validated instance".
+  The templates only serve the CUDA-graph-capacity layout; an upstream op would need a
+  schedule keyed on the live length (or max_seq) instead of kv_indices.numel().
+- Decode numerics (block 0, rows 1/4/64 @16k, 1 @2k, seeds 0 and 100): T, Ttp4, B, B1, B2 all
+  PASS; T max_abs 3e-5..2.3e-4 vs B 3.5e-4..3.9e-3 (T ~10x closer to the fp32 reference).
+- Prefill numerics: T FAILS the bf16 criterion on the benign draw (seed 0) at p1024/p4096/
+  p6143/p8192/p4096x4 while B and B1 pass: 0.08% of elements, confined to the first ~40 query
+  rows (causal rows that see < ~40 keys), max_abs 0.10-0.19 vs B 0.02-0.03; rows >= ~500 have
+  error 0.007-0.01 vs B 0.002.  With an 8192-token prefix (p8192x1+8192) T passes.  On the
+  cancellation draw (seed 100) all arms fail (B too), T worse (0.23-0.51 vs 0.08-0.11).
+  Per the stop rule this is a T-fails-while-B-passes numerics blocker for the prefill member.
+
+TIMING (GPU 6, image n38, blocks 1-3 + C1g n37 blocks 1-3; GPU-7 blocks moved to
+results/C1*/gpu7_discarded/ after the coordinator reassigned GPU 7).  Tables: results/C1d.md,
+C1p.md, C1g.md (+ .csv).  Ring = 512 MiB budget over query+kv_indices (decode) / query (prefill);
+the 4.5 M-slot pool is shared (random slots; rotating members get shifted slot sets).
+decode (13 graph-capacity shapes): geomean speedup vs best AITER arm 1.284 rotating / 1.289 hot;
+  vs B (paged_attention_ragged exactly as SGLang calls it) 1.41 rotating.  Wins 1.15-1.58x at
+  rows <= 32; parity at rows 64 x ctx 16k/64k (1.01-1.02x vs unified_attention).  Ttp4 (rows 4,
+  TP4 profile) = T within 2% (GPU-7 block 1).  Numerics pass everywhere, T ~10x closer to fp32.
+prefill: T 1.46/1.28/1.14x vs best AITER (unified_attention) at 1024/4096/4096x4, loses at
+  6143/8192/8192+8192 prefix (0.86-0.93x); vs SGLang's CK mha_batch_prefill path 1.34-2.41x.
+  T fails the bf16 criterion on the benign draw (first ~40 causal rows), B/B1 pass -> blocker.
+output gate (C1g, parity member): AITER's port paged_attention_output_gate_group_fp8_quant is
+  UNSUPPORTED in BOTH images: n37 (Triton 3.7) and n38 (pinned Triton 3.8.0+gitdf3f91dd) -- probe
+  reason "this Gluon build predates shared_memory_descriptor.reinterpret (Triton 3.8.0)".  So the
+  parity-vs-port measurement is impossible on our Triton pin.  What SGLang runs instead
+  (paged_attention_ragged hd256 + SGLang fused_sigmoid_mul): T is 2.34/1.94/1.50x faster at rows
+  1/4/8 (n38), identical in n37 (B37 36.2/66.1/110.2 us vs 36.0/66.0/110.0 us).
+SGLang 703e763d5f never references paged_attention_output_gate_group_fp8_quant (nor
+  fused_gdn_decode_qkvz / fused_gdn_prefill_qkvz): Qwen3.5 gating is forward_prepare + backend
+  attention + fused_sigmoid_mul (qwen3_5.py:1632-1634), unconditionally of Triton version.

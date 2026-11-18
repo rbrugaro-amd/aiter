@@ -1,0 +1,69 @@
+S6  DSA indexer prepare (GLM-5.2 MXFP4, bf16 indexer weights; replicated so TP4 == TP8 shapes)
+=========================================================================================
+Image: nightly1117-triton38 (n38) only, GPU 2.  Harness: xbench/cands/S6.py.
+STATUS: 3 blocks complete (node daemon dropped once at ~06:27 UTC and came back at 06:43; /scratch survived,
+the real block-1 jsonl was pulled).  Table: results/S6.md / S6.csv (xbench.merge).  Calibration copy 5511/5512/5514
+GB/s, mm 1489/1476/1478 TFLOP/s across blocks.  Pre-check numerics files (superseded criteria) are in
+S6/precheck_superseded/ and excluded from the merge.
+Anomaly: key-only B/B1 were ~11-13 us faster in block 2 only (T unchanged, in-block A/A <= 0.5%); block 2 runs
+shapes in reverse order (key-only first).  Single-call profile of B at k4193 shows AITER ck_tile Layernorm2dFwd at
+~29 us for a 4193x128 bf16 LayerNorm in both orders, so the block-2 drop is most likely that LN kernel; not
+resolved.  Merge noise floor for k-shapes is therefore 10-20%; the conservative per-block minimum speedups
+(1.74x / 1.40x / 1.25x at 4193/8192/16384) still clear 1.10x.
+Templates (sha256 checked vs templated manifests)
+  m 1..16  : glm52/indexer_prepare_r3/decode_tp4_template.py::indexer_prepare (tp4 templated, 173a1005)
+  m128/256 : glm52/indexer_prepare_xl/decode_tp8_lds_x.py::indexer_prepare (tp8 templated, 6676dc03)
+  key-only : glm52/indexer_prepare_key_only_xl/prefill_tp4_x.py::indexer_prepare_key_only (9864019d) m 4193/8192/16384
+  Inputs: spec make_inputs (glm52__indexer_prepare / _key_only), seeds 0 and 100, sha256 manifest; 262144-slot pool.
+
+TRACE: what stock SGLang 703e763d5f runs (source: srt/layers/attention/dsa/dsa_indexer.py + kernel capture)
+  Decode, rows <= 48 (GLM-5.2 on gfx950, default --enable-dsa-fused-indexer=None -> auto ON):
+    Gfx950FusedIndexer.run nodes 1-2 = SGLang's own JIT HIP kernels, NOT AITER:
+      sglang::dsa_gfx950::dual_gemv_kernel  +  sglang::dsa_gfx950::qk_rope::qk_rope_hadamard_quant_kernel
+    (it includes AITER headers but no AITER op).  Timed as context arm X_fused.  Gate: scale_fmt ue8m0,
+    non-neox rope, LayerNorm k_norm, bf16 weights, aiter preshuffled paged-MQA available, MAX_ROWS=48.
+  Decode, rows > 48 (m128/256) with that default: the fused path declines and, because enabling it
+    switched the AITER fused writer off at init, SGLang runs the legacy chain: 3 bf16 linears
+    (UnquantizedLinearMethod -> AITER tgemm / AITER triton a16w16), LayerNorm (AITER ck_tile), AITER rope,
+    fast_hadamard_transform (non-AITER pip pkg), TileLang act_quant for q, AITER indexer_k_quant_and_cache,
+    torch.compile'd weight scaling.  Read from source only; not timed (needs the TileLang act_quant +
+    torch.compile pieces; out of budget).
+  AITER fused-writer configuration (--no-enable-dsa-fused-indexer, or any gfx950 deployment where the fused
+    indexer is unsupported): Indexer._aiter_fused_fp8_prepare_and_store =
+      wq_b/wk/weights_proj linears -> AITER (m1: triton _gemm_a16_w16 for wq_b, skinny wv_splitk_small for
+      wk/gate [tuned rows, libtype skinny sol2]; m16/128: flydsl hgemm rows from bf16_tuned_gemm.csv)
+      + aiter::indexer_qk_rope_quant_and_cache_kernel (preshuffle=True, ue8m0, is_neox False).
+    This AITER writer omits the Hadamard; SGLang then skips the rotation on both q and k (q.k invariant).
+    => arm B (decode).  Same work as T except the Hadamard (B does less work).
+  Key-only prefill (_forward_cuda_k_only, default config): _get_k_bf16 (wk linear -> flydsl hgemm
+    t64x128x64 [tuned row padded_M 8192], sglang LayerNorm -> AITER ck_tile Layernorm2dFwd, AITER rope
+    kn_entry_2c_sbhd_cached_indirect_inplace, fast_hadamard_transform_kernel [non-AITER]) +
+    aiter::indexer_k_quant_and_cache_kernel  => arm B (SGLang's own _get_k_bf16 called unbound on a
+    stand-in module).  B1 = same with rotate=False (the AITER-writer configuration, no Hadamard).
+  No single AITER op covers projections + norm + rope + Hadamard + quant + cache; the closest
+  (indexer_qk_rope_quant_and_cache) has no projections and no Hadamard.
+
+Numerics (deviation from A5, documented): A5's fp8 code-point rule (<=1 code on <=0.5%) is unusable
+  across implementations with different bf16 rounding points / GEMM split-K (code diffs near zero are
+  many code points but tiny in value).  Used instead: dequantized value vs reference (fp64 projections,
+  fp32 elementwise, bf16 rounding at the materialization points), error / row amax <= 32/448 (~1 code at the
+  top binade); ue8m0 scale 2x flips reported, not failed; weights rtol 1e-2; untouched cache bytes must be
+  identical (all arms: 0 bytes differ).  AITER-writer arms are checked against a no-Hadamard reference.
+  T: passes everywhere except weights on the adversarial (seed 100, cancelling-projection) draw at
+     m128/m256 (0.17% of weights beyond rtol 1e-2) -- B fails the same check on ~95%.
+  B (AITER): fails on most shapes: k cache error up to 0.09-0.10 x amax on benign data (m>=2) and
+     0.36-0.50 x amax on seed 100; gate weights 17% beyond rtol 1e-2 on benign data.  Root cause measured
+     directly: AITER's bf16 GEMM for (N=128/32, K=6144) at m16 (flydsl hgemm ks8 via tgemm) differs from
+     correctly-rounded bf16 in 61% of outputs, max abs 0.026 vs torch F.linear 0.0078 (fp64 ref).  m1
+     (skinny) is exact.  So no "T fails while B passes" blocker.
+  X_fused (SGLang HIP): bit-identical codes to T on seed 0; passes.
+
+Results (3 blocks, median of block medians): T vs best AITER arm, rotating (headline): decode m1-16
+  2.21-2.62x, m128 1.92x, m256 1.89x; key-only prefill 2.13x (4193, min 1.74), 1.71x (8192, min 1.40),
+  1.45x (16384, min 1.25).  Uniform geomean rotating 2.12x over 10 shapes; hot 3.05x over 7.
+  vs SGLang's default non-AITER gfx950 fused decode (m<=16, block 1): 1.20-1.27x rotating, 1.39-1.48x hot.
+Verdict: PR (>= 1.10x vs best AITER arm on rotating at every shape, incl. worst block; no T-fails-B-passes cell).
+  T numerics 'FAIL' cells at m128/m256 = gate weights on the adversarial seed-100 draw (0.17% beyond rtol 1e-2);
+  B fails the same check on ~95%.  Serving-weighted summary: uniform over served M rows.
+  The stock decode path at rows<=48 is SGLang's own HIP fused indexer, which T beats by ~1.25x (rotating), so
+  the upstream value is an AITER fused prepare op rather than a 2x SGLang decode gain.

@@ -1,0 +1,81 @@
+S5  Qwen3.5 attention prologue (Gemma q/k RMSNorm + interleaved mRoPE (11,11,10) on 64/256 dims
+    + q|gate deinterleave + FP8 KV-cache write, page 1, unit scales).  GPU 3, image n38
+    (nightly1117-triton38).  Code: xbench/cands/S5.py.
+
+STATUS: 3 timing blocks complete (b1 with numerics; b2, b3).  The node daemon was down 06:27-06:43
+UTC; the in-flight job was lost and re-run after it came back (no data from the outage is used).
+
+TRACE (stock SGLang 703e763d5f, ROCm, SGLANG_USE_AITER=1; source read + torch-profiler capture):
+  models/qwen3_5.py _prepare_qkv_gate -> (HIP and attn_output_gate) forward_prepare_fused_gate:
+    1. sglang Triton _fused_qk_gemma_rmsnorm_gate_kernel        (models/utils.py:964)
+    2. MRotaryEmbedding.forward -> sglang Triton _triton_mrope_forward_fused (fp32 cos/sin table on HIP)
+    3. aiter_backend.forward_decode -> _use_fused_fp8_kv_write -> sglang Triton reshape_and_cache_flash
+       (kernels/ops/kvcache/cache_ops.py), NHD page-1 fp8 pool (non-5D, non-SWA).
+  => NO AITER kernel in the stock Qwen3.5 prologue.  SGLang only uses AITER's fused HIP op
+     (fused_qk_norm_mrope_3d_cache_pts_quant_shuffle) for Qwen3/Qwen3-VL (models/qwen3.py), not Qwen3.5.
+  Stock timed once as context arm X (3 kernels, 5.8-6.6 us).
+
+ARMS
+  T   M 1,2,4,8: qwen3_5/mxfp4/..._xl/xl_decode_small_template.py (labels m*)
+      M 8..64:   qwen3_5/fp8/..._templated/faqk_template.py      (labels f*)   (sha256 vs manifest checked)
+  B1  torch.cat deinterleave (q,k,v) + gate copy + AITER HIP fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
+      (gemma_norm=True, rotary_dim=64, interleaved mRoPE, NHD fp8 write, CPU unit scales; called like
+      SGLang's qwen3.py).  Same work as T; the only AITER arm valid for distinct mRoPE rows.
+      Kernel alone ~8 us (trace), cat ~5 us, gate copy ~4.7 us (profiler, eager).
+  B2  AITER Triton fused_qkv_split_qk_norm_rope_cache (attn_output_gate, interleaved, NHD, fp8 cache).
+      1-D RoPE -> valid only for identical-rows (text-only decode) positions.  Same work as T.
+      Plan deviation: the plan said fold (1+w) into the weights; measured, this kernel already applies
+      (1+w), so raw Gemma weights are passed (folding double-adds 1).
+  B3  AITER Triton fused_qk_norm_rope_gate_fp8_quant (+ sglang reshape_and_cache_flash KV write).
+      EXTRA work (per-sequence fp8 Q/K/V quant, 6 kernels); identical-rows only.  15.8-20 us.
+  X   stock SGLang sequence above (context, non-AITER).
+  Headline "best AITER arm" = min over B1/B2/B3 = B2 on every identical-rows row.
+
+INPUTS  projected_qkv_gate [M,4608] bf16; positions = [3,M] view of a [3,512] int64 buffer (served
+  stride); cos_sin [262144,64] bf16; small pool 32768 slots, big pool 9,437,184 slots x 256 B =
+  2.42 GB per cache (> 2^31 B) with written slots at the top (slot*256 >= 2^31).  Draws: id =
+  identical t/h/w rows (text decode), dr = distinct rows.  Seeds 0 (benign) and 100 (magnitudes
+  2^-8..2^8, V saturates fp8).  Rotating ring rotates packed, weights, positions, slots and the small
+  caches (32 copies, ~512 MiB); cos/sin table shared (one table for all layers in serving).
+
+NUMERICS (fp32 reference with the bf16 rounding after the norm; satfinite fp8 for V/K codes)
+  T : PASS on every shape and both seeds (q 0-ULP-class errors, gate bit-exact, K codes exact,
+      V bytes exact, untouched slots unchanged, big pool correct).
+  B1: PASS everywhere (incl. distinct rows and the >2^31-byte pool).
+  B3: PASS everywhere it applies.
+  B2: q passes the bf16 criterion, but K-cache fp8 codes differ by 1-3 codes on 0.5-2.3% of elements
+      (> 0.5% allowance): it does not round the normalized K to bf16 before RoPE.  Near-miss, flagged
+      FAIL in the table.  V/gate exact.
+  X (stock SGLang): PASS on all 28 cells in n38_b1_numX.jsonl.  The X numerics records inside
+      n38_b1.jsonl are INVALID (harness bug in my X arm: MRotaryEmbedding cached by id(), reused
+      across freed inputs -> stale rope table); fixed (data_ptr key, tensor kept alive) and rerun as
+      n38_b1_numX.jsonl.  X timing is unaffected.
+  Reference fix during the run: torch .to(float8_e4m3fn) gives NaN above 448 while all five kernels
+  saturate; the reference now clamps to +-448.  The pre-fix numerics file is kept as
+  results/S5/INVALID_n38_b0_numcheck_staleref.jsonl.txt (not merged).
+
+TIMING (3 blocks; graph replay, count 2000, 15 rounds/block, ABBA; median of block medians, us)
+  T 1.80-2.09; B2 2.06-2.69; B1 11.5-15.2; B3 15.8-20.0; X 5.8-6.6.
+  A/A (T vs T#2, B1 vs B1#2): up to ~6-7% on these ~2 us kernels (T#2 is consistently ~5% lower
+  than T: second-captured graph effect), so the parity band is ~10-14% on the m* rows; block-to-block
+  speedup spread <= 2.5%.  Calibration copy 4969-5036 GB/s, mm 1455-1469 TFLOP/s across blocks.
+  Speedup vs best AITER (B2): 1.13-1.33 on every row; all cells outside the band ("win"); m1 is the
+  weakest (1.15 rotating vs a 11.6% band).
+  vs B1 (the AITER op that handles real mRoPE, numerically clean): 6.5-8.0x.
+  vs stock SGLang (X, context): ~3.2x.
+
+SUMMARY  rotating, uniform weights over served rows m1,m2,m4,m8,f8,f16,f32,f64 (no Qwen3.5
+  per-concurrency decode-M distribution was available): geomean 1.263x vs best AITER arm (B2);
+  hot 1.207x.  Big-pool and distinct-rows rows agree.
+VERDICT  PR (passes the stop rule: >= 1.10x on rotating vs the best AITER arm, T numerics pass) --
+  Note the best AITER arm (B2)
+  only works for text-only identical-row positions and misses the bf16 boundary on K codes; against
+  the AITER op that supports real mRoPE (B1) the gap is ~7x.  PR shape: extend
+  fused_qkv_split_qk_norm_rope_cache (or the HIP mrope op) with 3-D interleaved mRoPE + the bf16
+  rounding point, or upstream the template as a new op.
+
+HARNESS NOTES (no shared-file edits)
+  - run.py numerics clones inputs per arm; arms that cache per-input state must not key by id().
+  - The node daemon/spool vanished 06:27-06:43 UTC while 6 GPU jobs were in flight (not caused by S5).
+  - The stale pre-fix numerics file is kept as results/S5/INVALID_n38_b0_numcheck_staleref.jsonl.txt
+    (renamed on node too, so pull does not bring it back into the merge).

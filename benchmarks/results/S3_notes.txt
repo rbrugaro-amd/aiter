@@ -1,0 +1,70 @@
+S3 GDN decode -- status: BLOCKED (node daemon heartbeat stopped 06:27:21 UTC; run_on_node exit 3). No timing blocks ran.
+
+Harness: xbench/cands/S3.py (arms T, B_port, B1, X_sgl; reset(), 32-set state ring, count 960/192),
+xbench/cands/S3_chain.py (64-step drift check, not run). Inputs generated on the node (/scratch/xb/inputs/S3,
+14 shapes x seeds 0/100) -- node-local, lost if the node is gone; regenerate with `python -m xbench.run --cand S3 --gen`.
+
+TRACE (n38 = nightly + Triton 3.8, torch profiler kernel names):
+  T nx (Qwen3-Next, template v2):   m1 _split_producer|_split_finish ; m16 _fused_heads
+  T q5f m2 _recurrent|_finish ; q5f m128 _prepare_split|_update_and_norm ; q5x m8 _recurrent|_finish ; q5x m64 _fused_decode
+  B_port (aiter fused_gdn_decode_qkvz, supported=True in n38): one launch
+     Qwen3-Next: _fused_decode_BATCH_{1,16,64}_INDEX64_0_HAS_FP8_1 (generated pair kernels)
+     Qwen3.5:    _decode_group_ratio_RATIO_4_NW_8_KL_16_KS_4_HAS_FP8_{1,0}_FLAT_1 (ratio-generic kernel)
+     n37 (Triton 3.7): probe returns False ("Triton >= 3.8 required ..."), the op raises ValueError -> no AITER fused path
+     (n37 confirmation run did not happen before the node died; reason string taken from source).
+  B1 (AITER composition): [nx: _fused_qkvzba_split_reshape_cat_decode_kernel] | gluon_causal_conv1d_update_split_qkv_kernel |
+     torch cat | [flat: 2-3 torch contiguous copies of a/b/z] | fused_rearrange_sigmoid_gated_delta_rule_update_kernel |
+     aiter gated_rmsnorm_fp8_group_quant_kernel (fp8 rows) / SGLang FLA _layer_norm_fwd_1pass_kernel (bf16 rows, non-AITER)
+  X_sgl (SGLang 703e763d5f stock ROCm decode, all SGLang Triton kernels):
+     fused_qkvzba_split_reshape_cat[_contiguous]_kernel | _causal_conv1d_update_kernel |
+     fused_recurrent_gated_delta_rule_packed_decode_kernel (FLA) | layer_norm_gated_fwd_kernel / _layer_norm_fwd_1pass_kernel |
+     [fp8 rows] aiter dynamic_per_group_scaled_quant_kernel (the per_1x128 quant inside out_proj's aiter_w8a8_block_fp8_linear).
+
+SGLang vs AITER (source read of 703e763d5f): no reference to fused_gdn_decode_qkvz / fused_gdn_prefill_qkvz /
+paged_attention_output_gate anywhere in python/sglang. GDN decode on ROCm: --linear-attn-backend default "triton" ->
+TritonGDNKernel (FLA packed decode); fused proj+conv (SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV) is gated on _is_cuda,
+so on ROCm the split + causal_conv1d_update stay separate SGLang Triton kernels. AITER on this path only via:
+ (a) the out_proj FP8 linear's aiter per_1x128 quant + bpreshuffle GEMM (for Qwen3.5 (N,K)=(4096,2048) at M<=32 SGLang's own
+     smallm_fp8_blockscale_gfx950 HIP kernel takes bf16 input and fuses the quant, so no AITER kernel there);
+ (b) speculative target-verify only with explicit --linear-attn-verify-backend aiter (FlyDSL flydsl_gdr_mtp_sglang +
+     causal_conv1d_update_sglang_flydsl). Plain decode never calls AITER GDN kernels.
+
+NUMERICS (one step vs fp32 torch reference, n38; criteria in S3.check docstring). First pass (old strict criteria) showed all
+arms incl. AITER and SGLang failing the A5 fp8 code criterion vs an fp32-derived reference (code_mismatch 2.7% T, 10% B1/X_sgl;
+scale rel 0.7% T vs 6% B1/X_sgl), so codes became informational and the dequantized value is checked instead.
+Key observations (seed 0, max_abs of touched fp32 state):
+  Qwen3-Next: T and B_port identical to ~1e-7 (same kernel lineage), 0.9-1.5e-3; B1/X_sgl 2-5e-3 (FLA-style kernels drift more).
+  Qwen3.5:    B_port 0.6-2.1e-3, T 3-7.6e-3 == X_sgl bit-for-bit-like (identical max_abs) -> T and SGLang's FLA kernel share the
+              arithmetic; AITER's ratio-generic port is ~2-4x closer to the fp32 reference on the state (seed 100: T 0.09-0.19 vs
+              B_port 0.02-0.09). bf16 normalized output passes the bf16 criterion for every arm.
+  conv window and untouched slots bit-exact for all arms.
+  Re-run with the final criteria did not complete (node lost).
+
+=== UPDATE 07:xx UTC: node back; all blocks done (n38 b1-b3, n37 b1-b3 on GPU 5), chain in n38 and n37. ===
+Merged: results/S3.csv, results/S3.md. Calibration copy 5014-5048 GB/s across all 6 blocks (<0.7% spread); A/A <= 1.2% except q5x rows (<= 4.9%).
+Timing (rotating, us, median of 3 blocks)  T | B_port(n38) | B1 | X_sgl | best n37 (B37)
+  nx_m1    4.33 | 4.55 | 13.5 | 13.2 | 13.1     T/B_port 1.05
+  nx_m8    5.37 | 5.36 | 17.5 | 15.4 | 15.6     1.00 (hot 0.91: T slower)
+  nx_m16   6.51 | 6.89 | 19.1 | 17.1 | 17.4     1.06
+  nx_m64  11.85 |11.87 | 26.6 | 23.8 | 23.9     1.00
+  q5f_m2   4.66 |13.43 | 20.1 | 14.9 | 15.0     2.88
+  q5f_m128 43.2 | 52.5 | 67.2 | 60.1 | 60.4     1.22
+  q5f_m256 98.5 |105.6 |125.4 |120.8 |121.2     1.07
+  q5x_m1   4.50 |11.20 | 12.7 | 11.8 | 12.2     2.49
+  q5x_m2   4.52 |11.38 | 20.2 | 12.6 | 12.9     2.52
+  q5x_m8   6.23 |11.80 | 22.4 | 14.8 | 15.1     1.89
+  q5x_m16  7.47 |12.11 | 25.9 | 17.6 | 18.0     1.62
+  q5x_m32  9.32 |14.67 | 30.9 | 20.9 | 21.4     1.57
+  q5x_m64 13.36 |23.19 | 42.3 | 31.7 | 31.8     1.74
+  q5x_m96 22.67 |38.56 | 54.8 | 45.5 | 45.8     1.70
+B37 (unmodified nightly, Triton 3.7): B_port unavailable ("Triton >= 3.8 required ..., got 3.7.0", op raises ValueError);
+best shipped arm is SGLang's own FLA chain (X_sgl) or B1; T vs B37 = 2.4-3.3x (rotating).
+Numerics (seed 0 = benign; seed 100 = adversarial 2^+-8 magnitudes + subnormal decay, where every arm incl. B_port misses the
+1e-3 state criterion on some rows):
+  Qwen3-Next: T == B_port to ~1e-7 (common source); pass on seed 0 and seed 100 at m1/m16/m64; 64-step chain identical.
+  Qwen3.5: T reproduces SGLang stock (X_sgl) arithmetic (same error stats); AITER's ratio-generic port is 2-3x closer to fp32
+    (64-step chain state med err: T 0.95-1.5e-5 vs B_port 3.8-6.5e-6; max 2.9-6.6e-3 vs 1.0-2.2e-3).
+    Seed 0: T fails where B_port passes at q5f_m128/m256 (fp8 dequant outside half-ulp on 0.005-0.12% of elems) and
+    q5x_m32/64/96 (bf16 output outside atol 2^-5/rtol 1e-2 on 5e-6..5e-5 of elems) -- same failures as SGLang stock.
+Side observation: in n37 (Triton 3.7) the chain script also ran T; most templates compiled and gave numerics identical to n38
+(nx_m8 failed: llvm_fn_attrs unsupported). Not bit-checked or timed; just an A8 data point.
