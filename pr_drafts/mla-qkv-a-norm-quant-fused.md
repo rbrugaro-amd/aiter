@@ -251,3 +251,5 @@ every partial buffer (and the M = 8 exchange) to fp32 makes all 14 shapes pass w
 other change (`bench/xbench/s1f32/`). Cost: <= 4% at M <= 32; 14% at M 64, 21-34% at
 M 128/256, 19% at M 1024, 9% at M 2048 (rotating). The large-M schedules need a re-tune
 (e.g. fewer splits, or fp32 only on the merge path) rather than a dtype switch.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
