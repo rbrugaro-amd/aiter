@@ -1,11 +1,14 @@
-# AITER PR drafts (templated gfx950 kernels)
+# AITER PR drafts (templated gfx950 kernels, GLM-5.2 / artemis PR #33 scope)
 
-Docs-only branch: PR descriptions for AITER PRs prepared from the Artemis templated kernels.
-Each PR's code is on its own branch of this fork; nothing has been opened upstream.
+Docs-only branch: PR descriptions for AITER PRs prepared from the Artemis templated kernels of the
+GLM-5.2 FP8 TP8/EP8/DP8 pack (`glm52_fp8_ep8`, artemis PR #33) and the shared `glm52_fp8` kernels
+it uses. Each PR's code is on its own branch of this fork; nothing has been opened upstream.
 
-| PR draft | code branch | status |
-|---|---|---|
-| [attn_res_gate gfx950 decode (Kimi-K3)](pr_drafts/attn_res_gate_gfx950_decode.md) | `attn-res-gate-gfx950-decode` | in progress |
+| PR draft | code branch | bench headline | status |
+|---|---|---|---|
+| Sparse MLA decode, EP8 H=64 fp8 KV (`sparse_mla_fwd`) | `sparse-mla-decode-gfx950` | 1.36-2.60x vs fastest AITER arm, ~2.1x vs fastest numerically passing arm | in progress |
+| GLM-5.2 FP8 DSA indexer prepare | `glm52-fp8-indexer-prepare` | not benchmarked yet | in progress |
+| GLM-5.2 FP8 qkv_a + RMSNorm + quant | `mla-qkv-a-norm-quant-fused` | 1.94x, but bf16 split-K partials fail a cancellation draw; fix in progress | in progress |
 
-Assessment and benchmark data behind these drafts (cluster, shared /home):
-`/home/rbrugaro/code/templating-infra/aiter/` (assessment.md, bench_plan.md, bench/results/).
+Assessment and benchmark data behind these drafts: `benchmarks/` on this branch, and
+`/home/rbrugaro/code/templating-infra/aiter/` on the cluster (assessment.md, bench_plan.md, bench/results/).
