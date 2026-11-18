@@ -237,6 +237,22 @@ fp32.
 - The weight scale layout is row-major `[ceil(N/128), K/128]`, the same tensor the CK
   bpreshuffle GEMM takes; the activation scale is internal (no transpose_scale question).
 
+## PR Self-Review
+
+Reviewed revision: `cae025695`.
+
+Behavior and intent: one new op; no existing behavior changes.
+
+Validation and unverified scope: commands, hardware and results above. Unverified: other
+architectures (the gate returns `(False, reason)`, tests skip), Triton 3.7 (gate returns
+`False`, not executed), CU counts other than 256 (no CU tree; schedules tuned on 256 CU),
+widths other than N = 2624 / K = 6144 (the gate accepts K, q, kv multiples of 128, but only
+the GLM-5.2 shape was measured).
+
+Changed op tests: `op_tests/triton_tests/fusions/test_fused_mla_qkv_a_proj_rmsnorm.py` (new)
+covers the new op only: reference agreement on three draws at every covered M, agreement with
+the AITER chain, determinism, support-probe reasons.
+
 ## Finding for the Artemis packs (not part of this PR)
 
 The GLM-5.2 FP8 `qkv_a_norm` kernels store split-K partials in bf16/fp16 and the M = 8
