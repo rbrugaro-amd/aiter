@@ -10,5 +10,7 @@ it uses. Each PR's code is on its own branch of this fork; nothing has been open
 | GLM-5.2 FP8 DSA indexer prepare | `glm52-fp8-indexer-prepare` | not benchmarked yet | in progress |
 | GLM-5.2 FP8 qkv_a + RMSNorm + quant | `mla-qkv-a-norm-quant-fused` | 1.94x, but bf16 split-K partials fail a cancellation draw; fix in progress | in progress |
 
+Handoff (branches, image, what to test per PR): [HANDOFF_glm52_aiter_prs.md](HANDOFF_glm52_aiter_prs.md).
+
 Assessment and benchmark data behind these drafts: `benchmarks/` on this branch, and
 `/home/rbrugaro/code/templating-infra/aiter/` on the cluster (assessment.md, bench_plan.md, bench/results/).
