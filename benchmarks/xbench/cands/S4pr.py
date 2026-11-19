@@ -25,6 +25,13 @@ SCALE, TOPK, DV = base.SCALE, base.TOPK, base.DV
 MAIN_SRC = os.environ.get("S4PR_MAIN", "/scratch/aiter_main_s4ep8/aiter/ops/triton/attention/sparse_mla.py")
 
 SHAPES = [s for s in base.SHAPES if s["prof"] == "fp8ep8"]
+# Served-size pools: LARGE 4194304 rows = 2.42 GB (> 2**31, buffer_load's offset range) and
+# XLARGE 7456541 rows = 4.29 GB (> 2**32, the GLM-5.2 FP8 EP8 serving pool; the uint32 slot
+# offset forms of rows 2 and 8 switch to int64 there).
+XLARGE = 7456541
+for _s in list(SHAPES):
+    for _pool, _sfx in ((base.LARGE, "_L"), (XLARGE, "_XL")):
+        SHAPES.append({**_s, "pool": _pool, "label": _s["label"] + _sfx})
 MODE = os.environ.get("S4PR_MODE", "graph")
 SEEDS = (0, 100)
 AA = ["T", "Bm2"]
